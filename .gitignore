@@ -1,0 +1,3 @@
+./history/*
+
+.DS_Store # 推荐：把它加入 .gitignore
