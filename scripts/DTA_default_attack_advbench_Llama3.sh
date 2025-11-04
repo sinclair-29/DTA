@@ -8,7 +8,6 @@ JUDGE_MODEL_PATH="$BASE_PATH/models/GPTFuzzer"
 DATA_FILE="$BASE_PATH/data/harmful_behaviors.csv"
 SAVE_DIR="./results/dta_llama2_mistral_advbench"
 
-# 创建保存目录
 mkdir -p "$SAVE_DIR"
 
 python src/main.py \

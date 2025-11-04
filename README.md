@@ -1,6 +1,10 @@
 # Dynamic Target Attack
 
-> This is the official repository of the submission on NeurIPS 2025, titled "Dynamic Target Attack"
+> This is the copy of repository of the submission on NeurIPS 2025, titled "Dynamic Target Attack"
+>
+> For original codes, see:
+>
+> https://anonymous.4open.science/r/Dynamic-Target-Attack-4176/README.md
 
 
 ## Abstract

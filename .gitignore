@@ -1,3 +1,9 @@
 ./history/*
 
-.DS_Store # 推荐：把它加入 .gitignore
+.DS_Store
+__pycache__
+*.pyc
+.env
+log.txt        
+data/
+results/
