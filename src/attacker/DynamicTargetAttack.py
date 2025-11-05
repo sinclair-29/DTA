@@ -1351,13 +1351,17 @@ class DynamicTemperatureAttacker:
             soft_init_logits = init_suffix_logits / 0.001
 
             # step 1. generate reference responses
+
+            # 安全且高效的做法
+            logits = soft_init_logits.float()  # 确保是 float32
+            probs = F.softmax(logits, dim=-1).half()  # softmax in fp32, then cast to fp16
+            embeddings = self.local_llm.get_input_embeddings().weight  # already fp16
+            output = torch.matmul(probs, embeddings)
+
             tmp_input_embeddings = torch.cat(
                 [
                     prompt_embeddings,
-                    torch.matmul(
-                        F.softmax(soft_init_logits, dim=-1).to(torch.float16),
-                        self.local_llm.get_input_embeddings().weight,
-                    ),
+                    output,
                 ],
                 dim=1,
             )
@@ -1478,13 +1482,17 @@ class DynamicTemperatureAttacker:
                 # step 3.2 Calculate CrossEntropy loss
                 soft_suffix_logits_ = (suffix_logits.detach() / 0.001  - suffix_logits).detach() + suffix_logits
                 # print("soft_suffix_logits_: ", soft_suffix_logits_)
+
+                # 安全且高效的做法
+                logits = soft_suffix_logits_.float()  # 确保是 float32
+                probs = F.softmax(logits, dim=-1).half()  # softmax in fp32, then cast to fp16
+                embeddings = self.local_llm.get_input_embeddings().weight  # already fp16
+                output = torch.matmul(probs, embeddings)
+
                 tmp_input_embeddings = torch.cat(
                     [
                         prompt_embeddings,
-                        torch.matmul(
-                            F.softmax(soft_suffix_logits_, dim=-1).to(torch.float16),
-                            self.local_llm.get_input_embeddings().weight,
-                        ),
+                        output,
                     ],
                     dim = 1
                 )
