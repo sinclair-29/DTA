@@ -1421,6 +1421,7 @@ class DynamicTemperatureAttacker:
                 .to(self.local_llm_device)
             )  # target_response_ids.shape = (1, L)
 
+            vocab_size = self.local_llm.get_input_embeddings().weight.shape[0]
             # 2. 识别无效的 token ID
             invalid_mask = (target_response_ids >= vocab_size) | (target_response_ids < 0)
 
