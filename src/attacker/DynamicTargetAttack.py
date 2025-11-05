@@ -1420,6 +1420,26 @@ class DynamicTemperatureAttacker:
                 .unsqueeze(0)
                 .to(self.local_llm_device)
             )  # target_response_ids.shape = (1, L)
+
+            # 2. 识别无效的 token ID
+            invalid_mask = (target_response_ids >= vocab_size) | (target_response_ids < 0)
+
+            # 3. 如果存在无效ID，则进行处理
+            if torch.any(invalid_mask):
+                print(
+                    f"!!! WARNING: Invalid token IDs detected in target_response_ids! Indices: {torch.where(invalid_mask)}")
+                print(f"Original invalid IDs: {target_response_ids[invalid_mask]}")
+
+                # 修复策略：将所有无效ID替换为一个安全的、常见的ID，比如 PAD token ID
+                # 这比直接丢弃要好，因为它能保持张量形状不变，避免后续代码出错。
+                pad_token_id = self.local_llm_tokenizer.pad_token_id
+                if pad_token_id is None:
+                    pad_token_id = self.local_llm_tokenizer.eos_token_id  # 如果没有pad_token，用eos_token替代
+                if pad_token_id is None:
+                    pad_token_id = 0  # 最后的备用方案
+
+                print(f"Replacing invalid IDs with pad_token_id: {pad_token_id}")
+                target_response_ids[invalid_mask] = pad_token_id
             
             suffix_mask = None
             suffix_noise = torch.nn.Parameter(
