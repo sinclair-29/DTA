@@ -1306,7 +1306,6 @@ class DynamicTemperatureAttacker:
             verbose: bool = False,
     ):
         print("prompt: ", prompt)
-        # 导入 amp 相关工具
         from torch.cuda.amp import autocast, GradScaler
         scaler = GradScaler()
 
@@ -1319,46 +1318,35 @@ class DynamicTemperatureAttacker:
         if not mask_rejection_words:
             rej_word_mask = None
         else:
-            rej_words = REJ_WORDS + [word.upper() for word in REJ_WORDS] + [
-                word.lower() for word in REJ_WORDS
-            ] + [word.capitalize() for word in REJ_WORDS]
+            rej_words = REJ_WORDS + [word.upper() for word in REJ_WORDS] + [word.lower() for word in REJ_WORDS] + [
+                word.capitalize() for word in REJ_WORDS]
             rej_words = " ".join(list(set(rej_words)))
-            rej_word_ids = self.local_llm_tokenizer.encode(
-                rej_words, add_special_tokens=False, return_tensors="pt"
-            )
+            rej_word_ids = self.local_llm_tokenizer.encode(rej_words, add_special_tokens=False, return_tensors="pt")
             rej_word_mask = torch.zeros(size=(1, self.local_llm.get_input_embeddings().weight.shape[0]),
                                         dtype=self.dtype, device=self.local_llm_device)
             rej_word_mask[0, rej_word_ids] = 1.0
-            rej_word_mask = rej_word_mask.unsqueeze(1).repeat(1, suffix_max_length, 1)  # (1, suffix_max_length, V)
+            rej_word_mask = rej_word_mask.unsqueeze(1).repeat(1, suffix_max_length, 1)
 
         best_unsafe_score = -1.0
-        best_suffix = None
-        best_test_response = None
-        best_iter_idx = -1
-        best_reference_response = None,
-        best_reference_response_score = None
+        best_suffix, best_test_response, best_iter_idx = None, None, -1
+        best_reference_response, best_reference_response_score = None, None
 
         for i in tqdm(range(num_iters), total=num_iters, desc="Outer Loop"):
             if i == 0:
-                init_suffix_logits = self._init_suffix_logits(
-                    model=self.local_llm,
-                    prompt_ids=prompt_ids,
-                    suffix_length=suffix_max_length,
-                    top_k=suffix_topk,
-                    rej_word_mask=rej_word_mask,
-                )
+                init_suffix_logits = self._init_suffix_logits(model=self.local_llm, prompt_ids=prompt_ids,
+                                                              suffix_length=suffix_max_length, top_k=suffix_topk,
+                                                              rej_word_mask=rej_word_mask)
             else:
                 init_suffix_logits = suffix_logits.detach().clone()
                 if rej_word_mask is not None:
                     init_suffix_logits = init_suffix_logits + rej_word_mask * -1e10
 
-            soft_init_logits = init_suffix_logits / 0.001
-
             with torch.no_grad():
-                # [FIX 1: Numerical Stability for Soft Prompt]
-                stable_probs = F.softmax(soft_init_logits.float(), dim=-1).to(self.dtype)
-                soft_embeddings = torch.matmul(stable_probs, self.local_llm.get_input_embeddings().weight)
-                tmp_input_embeddings = torch.cat([prompt_embeddings, soft_embeddings], dim=1)
+                # 使用 gumbel-softmax 获得一个离散的近似 token，用于生成参考响应
+                gumbel_probs_for_ref = F.gumbel_softmax(init_suffix_logits.float(), tau=0.1, hard=True).to(self.dtype)
+                soft_embeddings_for_ref = torch.matmul(gumbel_probs_for_ref,
+                                                       self.local_llm.get_input_embeddings().weight)
+                tmp_input_embeddings = torch.cat([prompt_embeddings, soft_embeddings_for_ref], dim=1)
 
                 ref_responses = self.generate_ref_responses(
                     model=self.ref_local_llm,
@@ -1370,9 +1358,7 @@ class DynamicTemperatureAttacker:
                 )
 
             ref_response_texts = self.ref_local_llm_tokenizer.batch_decode(
-                ref_responses[:, prompt_length + suffix_max_length:], skip_special_tokens=True,
-            )
-
+                ref_responses[:, prompt_length + suffix_max_length:], skip_special_tokens=True)
             best_ref_response, best_ref_response_score, best_ref_response_index = None, 0.0, -1
             for ref_idx, ref_response in enumerate(ref_response_texts):
                 scores = self.judge_by_gptfuzzer(model=self.judge_llm, tokenizer=self.judge_llm_tokenizer,
@@ -1381,18 +1367,15 @@ class DynamicTemperatureAttacker:
                     best_ref_response, best_ref_response_score, best_ref_response_index = ref_response, scores[
                         1], ref_idx
 
-            print(
-                f"best_ref_response: {best_ref_response}\t best_ref_response_score: {best_ref_response_score}\t best_ref_response_index: {best_ref_response_index}")
+            print(f"best_ref_response: {best_ref_response}\t best_ref_response_score: {best_ref_response_score}")
 
             target_response_ids = ref_responses[best_ref_response_index,
                                   prompt_length + suffix_max_length: prompt_length + suffix_max_length + forward_response_length].unsqueeze(
                 0).to(self.local_llm_device)
 
-            # [FIX 2: Crash Prevention]
             vocab_size = self.local_llm.get_input_embeddings().weight.shape[0]
             invalid_mask = (target_response_ids >= vocab_size) | (target_response_ids < 0)
             if torch.any(invalid_mask):
-                print(f"!!! WARNING: Invalid token IDs detected! {target_response_ids[invalid_mask]}")
                 pad_token_id = self.local_llm_tokenizer.pad_token_id or self.local_llm_tokenizer.eos_token_id or 0
                 target_response_ids[invalid_mask] = pad_token_id
 
@@ -1402,63 +1385,56 @@ class DynamicTemperatureAttacker:
             init_suffix_logits_ = init_suffix_logits.detach()
 
             for j in tqdm(range(num_inner_iters), total=num_inner_iters, desc="Inner Loop"):
+                optimizer.zero_grad()
                 suffix_logits = init_suffix_logits_ + suffix_noise
 
-                # [FIX 3: NaN Loss Prevention using autocast]
                 with autocast(enabled=(self.dtype == torch.float16)):
-                    # Calculate soft embeddings for CE loss
-                    soft_suffix_logits_ce = (suffix_logits / 0.001)
-                    stable_probs_ce = F.softmax(soft_suffix_logits_ce.float(), dim=-1).to(self.dtype)
-                    soft_embeddings_ce = torch.matmul(stable_probs_ce, self.local_llm.get_input_embeddings().weight)
+                    # 使用 Gumbel-Softmax 替代不稳定的温度缩放
+                    soft_suffix_gumbel = F.gumbel_softmax(suffix_logits.float(), tau=0.1, hard=True).to(self.dtype)
+
+                    # CE Loss branch
+                    soft_embeddings_ce = torch.matmul(soft_suffix_gumbel, self.local_llm.get_input_embeddings().weight)
                     tmp_input_embeddings_ce = torch.cat([prompt_embeddings, soft_embeddings_ce], dim=1)
+                    pred_resp_logits, tot_input_length = self.soft_model_forward_decoding(model=self.local_llm,
+                                                                                          input_embeddings=tmp_input_embeddings_ce,
+                                                                                          target_response_token_ids=target_response_ids)
 
-                    pred_resp_logits, tot_input_length = self.soft_model_forward_decoding(
-                        model=self.local_llm,
-                        input_embeddings=tmp_input_embeddings_ce,
-                        target_response_token_ids=target_response_ids,
-                    )
+                    # Fluency Loss branch
+                    pred_suffix_logits = self.soft_forward_suffix(model=self.local_llm,
+                                                                  prompt_embeddings=prompt_embeddings,
+                                                                  suffix_logits=suffix_logits)
 
-                    # Calculate soft embeddings for fluency loss
-                    soft_suffix_logits_flu = (suffix_logits / 0.001)
-                    pred_suffix_logits = self.soft_forward_suffix(
-                        model=self.local_llm,
-                        prompt_embeddings=prompt_embeddings,
-                        suffix_logits=soft_suffix_logits_flu,  # Corrected argument
-                    )
+                # --- 损失计算在 float32 下进行，以确保稳定 ---
+                pred_resp_logits_float32 = pred_resp_logits.float()
+                suffix_logits_float32 = suffix_logits.float()
+                pred_suffix_logits_float32 = pred_suffix_logits.float()
 
-                    # Calculate CE loss
-                    resp_logits_sliced = pred_resp_logits[:, tot_input_length - 1: -1, :].reshape(-1, vocab_size)
-                    ce_loss = F.cross_entropy(resp_logits_sliced, target_response_ids.view(-1))
+                resp_logits_sliced = pred_resp_logits_float32[:, tot_input_length - 1: -1, :].reshape(-1, vocab_size)
+                ce_loss = F.cross_entropy(resp_logits_sliced, target_response_ids.view(-1))
 
-                    # Calculate Fluency loss
-                    if suffix_topk > 0:
-                        _, indices = torch.topk(suffix_logits, suffix_topk, dim=-1)
-                        suffix_mask = torch.zeros_like(suffix_logits).scatter_(2, indices, 1)
-                    else:
-                        suffix_mask = None
+                if suffix_topk > 0:
+                    _, indices = torch.topk(suffix_logits_float32, suffix_topk, dim=-1)
+                    suffix_mask = torch.zeros_like(suffix_logits_float32).scatter_(2, indices, 1)
+                else:
+                    suffix_mask = None
 
-                    suffix_flu_loss = self.soft_negative_likelihood_loss(
-                        self.topk_filter_3d(pred_suffix_logits, topk=suffix_topk, suffix_mask=suffix_mask,
-                                            rej_word_mask=rej_word_mask),
-                        suffix_logits
-                    )
+                suffix_flu_loss = self.soft_negative_likelihood_loss(
+                    self.topk_filter_3d(pred_suffix_logits_float32, topk=suffix_topk, suffix_mask=suffix_mask,
+                                        rej_word_mask=rej_word_mask), suffix_logits_float32)
 
-                    loss = ce_loss * 100 + suffix_flu_loss
-                    if rej_word_mask is not None:
-                        rej_word_loss = self.batch_log_bleulosscnn_ae(suffix_logits.transpose(0, 1),
-                                                                      rej_word_ids.to(self.local_llm_device),
-                                                                      ngram_list=[1, 2, 3])
-                        loss -= 10 * rej_word_loss.mean()
-
-                optimizer.zero_grad()
+                loss = ce_loss * 100 + suffix_flu_loss
+                if rej_word_mask is not None:
+                    rej_word_loss = self.batch_log_bleulosscnn_ae(suffix_logits.transpose(0, 1),
+                                                                  rej_word_ids.to(self.local_llm_device),
+                                                                  ngram_list=[1, 2, 3])
+                    loss = loss - 10 * rej_word_loss.mean()
 
                 if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"!!! WARNING: Loss is {loss.item()}. Skipping step.")
+                    if j % 10 == 0: print(f"!!! WARNING: Loss is {loss.item()}. Skipping step.")
                     continue
 
-                # [FIX 4: GradScaler for backward pass]
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)  # Unscale for gradient clipping
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_([suffix_noise], max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
@@ -1466,7 +1442,7 @@ class DynamicTemperatureAttacker:
 
                 if verbose and (j + 1) % 50 == 0 or j == num_inner_iters - 1:
                     print(
-                        f"Loss: {loss.item():.4f}, Score: {best_ref_response_score:.4f}, Suffix Flu Loss: {suffix_flu_loss.item():.4f}, Suffix CE Loss: {ce_loss.item():.4f}")
+                        f"Loss: {loss.item():.4f}, Score: {best_ref_response_score:.4f}, Flu Loss: {suffix_flu_loss.item():.4f}, CE Loss: {ce_loss.item():.4f}")
 
             with torch.no_grad():
                 suffix_token_ids = torch.argmax(F.softmax(suffix_logits.float(), dim=-1), dim=-1)
@@ -1483,19 +1459,14 @@ class DynamicTemperatureAttacker:
                 print("scores: ", scores)
 
             if scores[1] > best_unsafe_score:
-                best_suffix = suffix_tokens
-                best_test_response = response
-                best_unsafe_score = scores[1]
-                best_iter_idx = i + 1
-                best_reference_response = best_ref_response
-                best_reference_response_score = best_ref_response_score
-                if verbose:
-                    print(f"New best found! Score: {best_unsafe_score:.4f}, Suffix: {best_suffix}")
+                best_suffix, best_test_response, best_unsafe_score, best_iter_idx = suffix_tokens, response, scores[
+                    1], i + 1
+                best_reference_response, best_reference_response_score = best_ref_response, best_ref_response_score
+                if verbose: print(f"New best found! Score: {best_unsafe_score:.4f}, Suffix: {best_suffix}")
 
             if (i + 1) >= 3 and best_unsafe_score >= 0.9: break
 
         return best_suffix, best_test_response, best_iter_idx, best_unsafe_score, best_reference_response, best_reference_response_score
-
 
     def soft_forward_suffix(
         self, 
