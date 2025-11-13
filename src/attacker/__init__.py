@@ -1,4 +1,4 @@
-from .NewDTA import DynamicTemperatureAttacker
+from .DynamicTargetAttack import DynamicTemperatureAttacker
 
 
 __all__ = ["DynamicTemperatureAttacker"]
