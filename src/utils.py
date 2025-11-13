@@ -169,6 +169,7 @@ def get_per_token_logps(model, input_ids, attention_mask, logits_to_keep):
 
 
 # @ modified from `trl` repo: trl/models/modeling_base.py/create_reference_model
+# 如果ref_llm == local_llm
 def create_reference_model(
     model: AutoModelForCausalLM,
     num_shared_layers: Optional[int] = None,

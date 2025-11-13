@@ -22,10 +22,10 @@ from constans import REJ_WORDS
 
 class DynamicTemperatureAttacker:
     def __init__(
-        self, 
-        local_llm_model_name_or_path: str = "/hub/huggingface/models/meta/llama-3-8B-Instruct", 
-        local_llm_device: Optional[str] = "cuda:0", 
-        judge_llm_model_name_or_path: str = "/hub/huggingface/models/hubert233/GPTFuzz/", 
+        self,
+        local_llm_model_name_or_path: str = "/hub/huggingface/models/meta/llama-3-8B-Instruct",
+        local_llm_device: Optional[str] = "cuda:0",
+        judge_llm_model_name_or_path: str = "/hub/huggingface/models/hubert233/GPTFuzz/",
         judge_llm_device: Optional[str]  = "cuda:1",
         ref_local_llm_model_name_or_path: Optional[str] = None,
         ref_local_llm_device: Optional[str] = "cuda:2",
@@ -52,6 +52,7 @@ class DynamicTemperatureAttacker:
             local_llm_model_name_or_path,
             torch_dtype=self.dtype,
         )
+        # 为什么这里的local_llm没有选用eval模式？
         self.local_llm_tokenizer = AutoTokenizer.from_pretrained(
             local_llm_model_name_or_path,
         )
@@ -72,7 +73,7 @@ class DynamicTemperatureAttacker:
                 self.ref_local_llm_model_name_or_path,
             )
             self.ref_local_llm_tokenizer.pad_token = self.ref_local_llm_tokenizer.eos_token
-        
+
         self.ref_generator = pipeline(
             "text-generation",
             model=self.ref_local_llm,
@@ -82,10 +83,11 @@ class DynamicTemperatureAttacker:
             do_sample=True,
             temperature = 0.7
         )
+        # ref_generator 和直接 model(inputs_embeds=cur_embeddings)的区别？
 
         self.ref_local_llm.to(self.ref_local_llm_device)
         self.ref_local_llm.eval()
-
+        # 为什么要添加这样一个 PEFT 的对象？
         local_llm_peft_config = AdaLoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
@@ -118,7 +120,7 @@ class DynamicTemperatureAttacker:
             self.judge_llm_tokenizer.pad_token = self.judge_llm_tokenizer.eos_token
 
     def _init_suffix(
-        self, 
+        self,
         suffix_length: int = 20,
         init_token: str = "!"
     ):
@@ -134,14 +136,14 @@ class DynamicTemperatureAttacker:
 
     def model_forward_decoding(
         self,
-        model, 
+        model,
         input_ids = None,
-        input_embeddings = None, 
+        input_embeddings = None,
         max_new_tokens = 30,
     ):
         """
             Forward pass through the model for decoding input_ids.
-            
+
         Args:
             model (`torch.nn.Module`):
                 The model to use for decoding.
@@ -151,7 +153,7 @@ class DynamicTemperatureAttacker:
                 Input embeddings for the decoding.
             max_new_tokens (`int`):
                 Maximum number of new tokens to generate.
-        
+
         Returns:
             `torch.Tensor`: Decoded output.
         """
@@ -200,10 +202,10 @@ class DynamicTemperatureAttacker:
         return torch.cat(generate_logits, dim = 1), torch.cat(generate_tokens, dim = 1) # logits, token_ids
 
     def soft_model_forward_decoding(
-        self, 
-        model, 
-        input_ids = None, 
-        input_embeddings = None, 
+        self,
+        model,
+        input_ids = None,
+        input_embeddings = None,
         target_response_token_ids = None,
     ):
         assert (input_ids is not None) ^ (
@@ -226,15 +228,15 @@ class DynamicTemperatureAttacker:
 
     def model_forward_decoding_with_chunks(
         self,
-        model, 
+        model,
         input_ids = None,
-        input_embeddings = None, 
+        input_embeddings = None,
         max_new_tokens = 256,
-        chunk_size = 30, 
+        chunk_size = 30,
     ):
         """
         Slice the input into chunks and generate tokens in each chunk.
-        
+
         Args:
             model (`torch.nn.Module`):
                 The model to use for decoding.
@@ -317,9 +319,9 @@ class DynamicTemperatureAttacker:
 
     def model_forward_decoding_with_chunks_v2(
         self,
-        model, 
+        model,
         input_ids = None,
-        input_embeddings = None, 
+        input_embeddings = None,
         max_new_tokens = 256,
         chunk_size = 30,  # 每次生成的token数量
     ):
@@ -333,9 +335,9 @@ class DynamicTemperatureAttacker:
 
     def model_forward_decoding_with_limited_KVCache(
         self,
-        model, 
+        model,
         input_ids = None,
-        input_embeddings = None, 
+        input_embeddings = None,
         max_new_tokens = 256,
         max_kv_cache_length = 128,  # 最大KV缓存长度
     ):
@@ -369,7 +371,7 @@ class DynamicTemperatureAttacker:
         generate_tokens = []
         generate_logits = []
 
-        
+
         output = model(
             inputs_embeds = input_embeddings,
             use_cache=True,
@@ -416,7 +418,7 @@ class DynamicTemperatureAttacker:
                 The KV cache to be trimmed.
             trim_length (int):
                 The length to which the KV cache should be trimmed.
-            
+
         Returns:
             tuple: The trimmed KV cache.
         """
@@ -466,9 +468,9 @@ class DynamicTemperatureAttacker:
 
     def model_forward_decoding_with_checkpoint(
         self,
-        model, 
+        model,
         input_ids = None,
-        input_embeddings = None, 
+        input_embeddings = None,
         max_new_tokens = 256,
         use_checkpoint = True,
     ):
@@ -494,7 +496,7 @@ class DynamicTemperatureAttacker:
 
         output = model(
             inputs_embeds = input_embeddings,
-            use_cache=not use_checkpoint, 
+            use_cache=not use_checkpoint,
         )
 
         logits = output.logits
@@ -513,7 +515,7 @@ class DynamicTemperatureAttacker:
             if use_checkpoint:
                 all_tokens = torch.cat(generate_tokens, dim=1)
                 full_embeddings = model.get_input_embeddings()(
-                    torch.cat([input_ids, all_tokens], dim=1) if input_ids is not None 
+                    torch.cat([input_ids, all_tokens], dim=1) if input_ids is not None
                     else all_tokens
                 )
 
@@ -542,9 +544,9 @@ class DynamicTemperatureAttacker:
         return torch.cat(generate_logits, dim=1), torch.cat(generate_tokens, dim=1)
 
     def _get_approximate_token_ids_from_embeddings(
-        self, 
-        model, 
-        input_embeddings, 
+        self,
+        model,
+        input_embeddings,
     ):
         embedding_layer = model.get_input_embeddings()
         embedding_weight = embedding_layer.weight
@@ -577,14 +579,14 @@ class DynamicTemperatureAttacker:
         top_p=0.95,
         num_return_sequences=10,
         max_length=256,
-        
+
         do_sample=True,
         use_cache=True,
-        batch_size_per_run=4, 
+        batch_size_per_run=4,
     ):
         """
         Generate reference responses using the model with input embeddings (optimized version).
-        
+
         Args:
             model (`torch.nn.Module`):
                 The model to use for generation.
@@ -612,7 +614,7 @@ class DynamicTemperatureAttacker:
                 Whether to use the model's KV cache for faster generation.
             batch_size_per_run (`int`, *optional*, defaults to 4):
                 Batch size for parallel processing to control memory usage.
-        
+
         Returns:
             `List[str]`: List of generated responses.
         """
@@ -727,7 +729,7 @@ class DynamicTemperatureAttacker:
 
         Args:
             Same as in generate_ref_responses
-            
+
         Returns:
             torch.Tensor: Generated token IDs of shape [batch_size * num_return_sequences, generated_seq_len]
         """
@@ -747,7 +749,7 @@ class DynamicTemperatureAttacker:
             current_batch_size = end_idx - start_idx
 
             original_sample_indices = [
-                start_idx // num_return_sequences + i 
+                start_idx // num_return_sequences + i
                 for i in range((start_idx + current_batch_size - 1) // num_return_sequences - start_idx // num_return_sequences + 1)
             ]
             original_sample_indices = [min(i, batch_size - 1) for i in original_sample_indices]
@@ -780,7 +782,7 @@ class DynamicTemperatureAttacker:
             if eos_token_id is None:
                 eos_token_id = getattr(tokenizer, 'pad_token_id', None)
             if eos_token_id is None:
-                eos_token_id = -1 
+                eos_token_id = -1
 
             sequences_finished = torch.zeros(len(batch_embeddings), dtype=torch.bool, device=device)
 
@@ -877,11 +879,11 @@ class DynamicTemperatureAttacker:
 
         # ✅ 返回 tensor，而不是 text
         return generated_ids  # shape: [batch_size * num_return_sequences, gen_len]
-    
+
     def judge_by_llama_guard_3(
         self,
-        model, 
-        tokenizer, 
+        model,
+        tokenizer,
         response,
     ):
         conversation = [
@@ -923,9 +925,9 @@ class DynamicTemperatureAttacker:
         return score_probs.squeeze(0).cpu().tolist()
 
     def judge_by_gptfuzzer(
-        self, 
-        model, 
-        tokenizer, 
+        self,
+        model,
+        tokenizer,
         response,
     ):
         """
@@ -1265,23 +1267,24 @@ class DynamicTemperatureAttacker:
         return suffix_tokens, responses
 
     def _init_suffix_logits(
-        self, 
+        self,
         model,
-        prompt_ids, 
-        suffix_length: int, 
+        prompt_ids,
+        suffix_length: int,
         temperature: float = 1.0,
         top_k: int = 10,
         rej_word_mask: torch.Tensor = None,
     ):
+        # 初始化方式是让模型生成一文本
         output = model.generate(
             input_ids=prompt_ids,
-            max_length = prompt_ids.shape[1] + suffix_length, 
-            do_sample = True, 
+            max_length = prompt_ids.shape[1] + suffix_length,
+            do_sample = True,
             top_k = top_k
         )
 
         init_suffix_logits = model(output).logits
-        init_suffix_logits = init_suffix_logits[:, -(suffix_length + 1) : -1, :] 
+        init_suffix_logits = init_suffix_logits[:, -(suffix_length + 1) : -1, :]
         # mask rejection words
         if rej_word_mask is not None:
             # print("init_suffix_logits.shape: ", init_suffix_logits.shape)
@@ -1326,6 +1329,7 @@ class DynamicTemperatureAttacker:
                                         dtype=self.dtype, device=self.local_llm_device)
             rej_word_mask[0, rej_word_ids] = 1.0
             rej_word_mask = rej_word_mask.unsqueeze(1).repeat(1, suffix_max_length, 1)
+        # rej_word_mask (1, 20, |V|)
 
         best_unsafe_score = -1.0
         best_suffix, best_test_response, best_iter_idx = None, None, -1
@@ -1469,10 +1473,10 @@ class DynamicTemperatureAttacker:
         return best_suffix, best_test_response, best_iter_idx, best_unsafe_score, best_reference_response, best_reference_response_score
 
     def soft_forward_suffix(
-        self, 
-        model, 
+        self,
+        model,
         prompt_embeddings,
-        suffix_logits, 
+        suffix_logits,
     ):
         suffix_probs = F.softmax(suffix_logits, dim = -1).type(torch.float16)
 
@@ -1493,9 +1497,9 @@ class DynamicTemperatureAttacker:
         return out_logits.detach()
 
     def topk_filter_3d(
-        self, 
-        suffix_logits, 
-        topk = 10, 
+        self,
+        suffix_logits,
+        topk = 10,
         suffix_mask = None,
         rej_word_mask = None,
     ):
@@ -1513,7 +1517,7 @@ class DynamicTemperatureAttacker:
 
     def soft_negative_likelihood_loss(
         self,
-        pred_logits, 
+        pred_logits,
         target_logits,
     ):
         probs = F.softmax(pred_logits, dim = -1)
@@ -1586,7 +1590,7 @@ class DynamicTemperatureAttacker:
         return loss
 
     def attack(
-        self, 
+        self,
         target_set: Optional[List[str]] = None,
         target_fn: Optional[str] = None,
         num_iters: int = 10,
@@ -1609,11 +1613,11 @@ class DynamicTemperatureAttacker:
             target_set (`List[str]`, *optional*):
                 List of target prompts
             target_fn (`str`, *optional*):
-                Path to the target function file
+                Path to the target function file  这里的path是什么意思？
             num_iters (`int`, *optional*, defaults to 100):
                 Number of iterations for optimization.
             learning_rate (`float`, *optional*, defaults to 0.00001):
-                Learning rate for optimization.
+                Learning rate for optimization. 关注这里的learning rate指的什么？
             response_length (`int`, *optional*, defaults to 256):
                 Length of the generated response.
             forward_response_length (`int`, *optional*, defaults to 20):
@@ -1626,7 +1630,7 @@ class DynamicTemperatureAttacker:
                 Whether to print detailed logs.
             save_path (`str`, *optional*, defaults to None):
                 Path to save the optimized suffix.
-        
+
         Returns:
             `None`
         """
@@ -1706,7 +1710,7 @@ def attack_on_whole_dataset():
     suffix_init_token = "!"
     mask_rejection_words = True
     verbose = False
-    
+
     start_index = 0
     end_index = 100
 
@@ -1720,7 +1724,7 @@ def attack_on_whole_dataset():
         reference_model_infer_temperature=reference_model_infer_temperature,
         num_ref_infer_samples=num_ref_infer_samples,
         forward_response_length=forward_response_length,
-        start_index = start_index, 
+        start_index = start_index,
         end_index = end_index,
     )
 
@@ -1758,7 +1762,7 @@ def attack_on_whole_dataset():
         mask_rejection_words=mask_rejection_words,
         verbose=verbose,
         save_path=save_path,
-        start_index = start_index, 
+        start_index = start_index,
         end_index = end_index,
     )
     #####################################################################################
