@@ -189,7 +189,7 @@ class DynamicTemperatureAttacker:
 
         suffix_logits = self._initialize_suffix_logits(prompt_ids, params)
         best_overall_score, best_results = -1.0, {}
-
+        # 在每个外层循环，suffix_logits会重新赋值还是沿用上次最好的
         for i in tqdm(range(params.num_outer_iters), desc="Outer Loop"):
             target_ids, ref_score, ref_text = self._generate_and_select_reference(prompt_embeds, suffix_logits, params)
             target_ids = target_ids.to(self.target_llm_device)
@@ -220,10 +220,13 @@ class DynamicTemperatureAttacker:
                 current_logits_float32 = base_logits_float32 + noise
 
                 # 使用 autocast 管理半精度浮点数 (float16) 的计算
+                # 这个上下文是什么意思？
+                # 当模型使用 float16（半精度）时启用 autocast，将部分运算转为 float16 以加速并节省显存，同时对容易溢出的操作（如 softmax、loss）保留 float32 精度。
                 with autocast(enabled=(self.dtype == torch.float16)):
                     # 将 logits 转回模型所需的 dtype，用于 Gumbel-Softmax 和矩阵乘法
                     current_logits_model_dtype = current_logits_float32.to(self.dtype)
                     gumbel_probs = F.gumbel_softmax(current_logits_model_dtype, tau=0.1, hard=True)
+                    # 也就是说，转回的方式是个近似？
                     suffix_embeds = gumbel_probs @ self.target_llm.get_input_embeddings().weight
 
                     full_embeds = torch.cat(
@@ -241,6 +244,7 @@ class DynamicTemperatureAttacker:
                 self.scaler.step(optimizer)
                 self.scaler.update()
 
+            # 结束内循环
             # 从 float32 更新回模型所需的 dtype
             suffix_logits = (base_logits_float32 + noise).detach().to(self.dtype)
 
