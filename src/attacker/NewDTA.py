@@ -1,5 +1,5 @@
 # -*- coding:utf-8 -*-
-# Author: Anonymous (Reforged by an AI Assistant, v3.3 - FP16 Safe & Stable)
+# Author: Anonymous (Reforged by an AI Assistant, v3.4 - Anti-Crash & Self-Healing)
 
 import torch
 import torch.nn as nn
@@ -52,7 +52,7 @@ class _AttackHyperparams:
     reference_temp: float
     num_ref_samples: int
     mask_rejection_words: bool
-    # Weights scaled down to prevent FP16 overflow (Original ratio 100:10:1)
+    # Weights
     w_ce: float = 10.0
     w_rej: float = 1.0
     w_flu: float = 0.1
@@ -93,7 +93,6 @@ class DynamicTemperatureAttacker:
     def _setup_models(self, target_path: str, ref_path: str, judge_path: str):
         logger.info("Setting up models...")
 
-        # Target LLM
         base_target_llm = AutoModelForCausalLM.from_pretrained(target_path, torch_dtype=self.dtype)
         self.target_tokenizer = AutoTokenizer.from_pretrained(target_path)
         peft_config = AdaLoraConfig(
@@ -103,7 +102,6 @@ class DynamicTemperatureAttacker:
         self.target_llm = get_peft_model(base_target_llm, peft_config)
         self.target_llm.to(self.target_llm_device).train()
 
-        # Reference LLM
         self.ref_llm = AutoModelForCausalLM.from_pretrained(ref_path, torch_dtype=self.dtype)
         self.ref_llm.to(self.ref_llm_device).eval()
 
@@ -117,7 +115,6 @@ class DynamicTemperatureAttacker:
         if self.ref_tokenizer.pad_token is None:
             self.ref_tokenizer.pad_token = self.ref_tokenizer.eos_token
 
-        # Validation Generator
         self.ref_generator = pipeline(
             "text-generation",
             model=self.ref_llm,
@@ -125,7 +122,6 @@ class DynamicTemperatureAttacker:
             device=self.ref_llm_device
         )
 
-        # Judge LLM
         self.judge_llm = RobertaForSequenceClassification.from_pretrained(judge_path, torch_dtype=torch.float32)
         self.judge_llm.to(self.judge_llm_device).eval()
         self.judge_tokenizer = RobertaTokenizer.from_pretrained(judge_path)
@@ -157,6 +153,12 @@ class DynamicTemperatureAttacker:
         for _ in range(max_length - seq_len):
             next_token_logits = outputs.logits[:, -1, :]
 
+            # --- 修复点 1：防止 Logits 为 NaN ---
+            if torch.isnan(next_token_logits).any() or torch.isinf(next_token_logits).any():
+                # 如果 Logits 坏了，将其重置为非常小的值，除了第一个 token (设为大值)
+                # 这会强迫模型输出 vocab 中的第一个词，防止崩溃
+                next_token_logits = torch.nan_to_num(next_token_logits, nan=-1e5, posinf=1e5, neginf=-1e5)
+
             if temperature > 0:
                 next_token_logits = next_token_logits / temperature
             if top_k > 0:
@@ -165,6 +167,18 @@ class DynamicTemperatureAttacker:
                 next_token_logits.scatter_(1, i, v)
 
             probs = F.softmax(next_token_logits, dim=-1)
+
+            # --- 修复点 2：防止 Probs 坏掉导致 multinomial 崩溃 ---
+            if torch.isnan(probs).any() or torch.isinf(probs).any() or (probs < 0).any():
+                # 将 NaN/Inf/负数 替换为 0
+                probs = torch.where(torch.isnan(probs) | torch.isinf(probs) | (probs < 0), torch.zeros_like(probs),
+                                    probs)
+                # 重新归一化
+                sum_probs = probs.sum(dim=-1, keepdim=True)
+                # 如果整行都是0，设为均匀分布
+                probs = torch.where(sum_probs == 0, torch.ones_like(probs) / probs.shape[-1],
+                                    probs / (sum_probs + 1e-8))
+
             next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
 
             if eos_token_id != -1:
@@ -202,9 +216,8 @@ class DynamicTemperatureAttacker:
             full_logits = self.target_llm(full_ids).logits
             init_logits = full_logits[:, prompt_ids.shape[1] - 1:-1, :].detach()
 
-            # === 修复: FP16下使用安全的负无穷值 ===
             if rej_mask is not None:
-                # 如果是 FP16，不能用 -1e10，因为会溢出成 -inf，导致 NaN
+                # 使用安全的负数
                 safe_neg_inf = -60000.0 if self.dtype == torch.float16 else -1e9
                 init_logits = init_logits + rej_mask * safe_neg_inf
 
@@ -213,7 +226,11 @@ class DynamicTemperatureAttacker:
     def _generate_and_select_reference(self, prompt_embeds: torch.Tensor, suffix_logits: torch.Tensor,
                                        params: _AttackHyperparams) -> Tuple[torch.Tensor, float, str]:
         with torch.no_grad():
-            # 强制 float32 进行 gumbel，避免 FP16 精度问题
+            # --- 修复点 3：输入净化 ---
+            if torch.isnan(suffix_logits).any():
+                logger.warning("Suffix logits contain NaN before generating reference. Resetting to 0.")
+                suffix_logits = torch.nan_to_num(suffix_logits, nan=0.0)
+
             gumbel_probs = F.gumbel_softmax(suffix_logits.float(), tau=0.1, hard=True).to(self.dtype)
             suffix_embeds = gumbel_probs @ self.target_llm.get_input_embeddings().weight
             full_input_embeds = torch.cat([prompt_embeds, suffix_embeds], dim=1).to(self.ref_llm_device)
@@ -232,7 +249,6 @@ class DynamicTemperatureAttacker:
             if score > best_score:
                 best_score, best_text, best_idx = score, text, idx
 
-        # 如果没有生成有效的，默认取第一个防止报错
         if best_idx == -1:
             best_idx = 0
             best_score = 0.0
@@ -243,14 +259,12 @@ class DynamicTemperatureAttacker:
         return target_ids.unsqueeze(0), best_score, best_text
 
     def _batch_log_bleulosscnn_ae(self, decoder_outputs, target_idx, ngram_list=[1, 2, 3]):
-        # decoder_outputs 应该是 FP32
         if decoder_outputs.shape[0] != 1:
             decoder_outputs = decoder_outputs.transpose(0, 1)
 
         batch_size, output_len, vocab_size = decoder_outputs.size()
         _, tgt_len = target_idx.size()
 
-        # 确保输入是 FP32，否则 log_softmax 容易溢出
         decoder_outputs = decoder_outputs.float()
         decoder_outputs = torch.log_softmax(decoder_outputs, dim=-1)
         decoder_outputs = torch.relu(decoder_outputs + 20) - 20
@@ -277,7 +291,6 @@ class DynamicTemperatureAttacker:
         return -sum_gram
 
     def _soft_forward_suffix(self, prompt_embeds, suffix_logits):
-        # 确保 softmax 在 float32 上进行
         suffix_probs = F.softmax(suffix_logits.float(), dim=-1).type(self.dtype)
         suffix_embeds = suffix_probs @ self.target_llm.get_input_embeddings().weight
         full_embeds = torch.cat([prompt_embeds, suffix_embeds], dim=1)
@@ -285,7 +298,6 @@ class DynamicTemperatureAttacker:
         return output[:, prompt_embeds.shape[1] - 1:-1, :]
 
     def _soft_negative_likelihood_loss(self, pred_logits, target_logits):
-        # 强制 FP32 计算 Loss
         probs = F.softmax(pred_logits.float(), dim=-1)
         log_probs = F.log_softmax(target_logits.float(), dim=-1)
         return -torch.sum(probs * log_probs, dim=-1).mean()
@@ -295,7 +307,6 @@ class DynamicTemperatureAttacker:
             if suffix_mask is None:
                 _, indices = torch.topk(logits, topk, dim=-1)
                 suffix_mask = torch.zeros_like(logits).scatter_(2, indices, 1)
-            # 使用 FP16 安全的负无穷
             safe_neg_inf = -60000.0 if logits.dtype == torch.float16 else -1e20
             return logits * suffix_mask + (1 - suffix_mask) * safe_neg_inf
         return logits
@@ -327,7 +338,6 @@ class DynamicTemperatureAttacker:
             invalid_mask = (target_ids >= vocab_size) | (target_ids < 0)
             target_ids[invalid_mask] = self.target_tokenizer.pad_token_id
 
-            # === 修复: 强制 Noise 和 累加计算使用 float32 ===
             base_logits_fp32 = suffix_logits.detach().clone().float()
             suffix_noise = torch.nn.Parameter(torch.zeros_like(base_logits_fp32), requires_grad=True)
 
@@ -336,12 +346,9 @@ class DynamicTemperatureAttacker:
 
             for j in tqdm(range(params.num_inner_iters), desc="Inner", leave=False):
                 optimizer.zero_grad()
-
-                # 在 FP32 下加噪
                 current_logits_fp32 = base_logits_fp32 + suffix_noise
 
                 with autocast(enabled=(self.dtype == torch.float16)):
-                    # Gumbel 输入必须是 float32 以保证稳定
                     soft_gumbel = F.gumbel_softmax(current_logits_fp32, tau=0.1, hard=True).to(self.dtype)
 
                     suffix_embeds = soft_gumbel @ self.target_llm.get_input_embeddings().weight
@@ -352,10 +359,8 @@ class DynamicTemperatureAttacker:
                     start_idx = prompt_embeds.shape[1] + params.suffix_length
                     pred_resp_logits = full_out[:, start_idx - 1: -1, :]
 
-                    # Fluency branch
                     pred_suffix_logits = self._soft_forward_suffix(prompt_embeds, current_logits_fp32.to(self.dtype))
 
-                # Loss 计算全部转为 float32
                 ce_loss = F.cross_entropy(
                     pred_resp_logits.float().reshape(-1, vocab_size),
                     target_ids.reshape(-1),
@@ -382,10 +387,12 @@ class DynamicTemperatureAttacker:
                     )
                     loss -= params.w_rej * rej_loss.mean()
 
-                if torch.isnan(loss) or torch.isinf(loss):
-                    logger.warning(f"Loss NaN/Inf at step {j}. Scaling back noise.")
+                # === 修复点 4：Inner Loop 的自愈机制 ===
+                if torch.isnan(loss) or torch.isinf(loss) or torch.isnan(suffix_noise).any():
+                    logger.warning(f"Loss NaN/Inf at step {j}. Resetting noise to 0 to recover.")
+                    # 之前的 .mul_(0.5) 救不回来 NaN，必须重置
                     with torch.no_grad():
-                        suffix_noise.data.mul_(0.5)
+                        torch.nn.init.zeros_(suffix_noise)
                     continue
 
                 self.scaler.scale(loss).backward()
@@ -396,7 +403,6 @@ class DynamicTemperatureAttacker:
                 self.scaler.update()
                 scheduler.step()
 
-            # 转回模型精度用于下一步 outer loop
             suffix_logits = (base_logits_fp32 + suffix_noise).detach().to(self.dtype)
 
             with torch.no_grad():
