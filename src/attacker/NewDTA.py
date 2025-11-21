@@ -427,8 +427,8 @@ class DynamicTemperatureAttacker:
                         "prompt": prompt, "suffix": final_suffix_text, "response": resp,
                         "score": score, "reference_response": ref_text
                     }
-                    if score > 0.9:
-                        break
+                    #if score > 0.9:
+                    #    break
 
         return best_results or {"prompt": prompt, "status": "failed"}
 
