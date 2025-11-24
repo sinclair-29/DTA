@@ -8,6 +8,8 @@ import torch.nn.functional as F
 import numpy as np
 import logging
 import json
+import os
+
 from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer,
@@ -55,9 +57,9 @@ class _AttackHyperparams:
     num_ref_samples: int
     mask_rejection_words: bool
     # --- NEW: Loss weights ---
-    w_ce: float = 1.0
+    w_ce: float = 10.0
     w_flu: float = 0.1
-    w_rej: float = 10.0
+    w_rej: float = 1.0
 
 
 class DynamicTemperatureAttacker:
@@ -93,6 +95,8 @@ class DynamicTemperatureAttacker:
             judge_llm_model_name_or_path
         )
         self.scaler = GradScaler()
+
+    #
 
     # ... (_setup_models, _initialize_suffix_logits, _generate_and_select_reference are unchanged) ...
     def _setup_models(self, target_path: str, ref_path: str, judge_path: str):
@@ -155,6 +159,7 @@ class DynamicTemperatureAttacker:
             suffix_embeds = gumbel_probs @ self.target_llm.get_input_embeddings().weight
             full_input_embeds = torch.cat([prompt_embeds, suffix_embeds], dim=1).to(self.ref_llm_device)
 
+            # 输入的是embeding
             ref_ids = self.ref_llm.generate(
                 inputs_embeds=full_input_embeds, max_new_tokens=params.response_length,
                 num_return_sequences=params.num_ref_samples, do_sample=True, temperature=params.reference_temp,
@@ -201,6 +206,8 @@ class DynamicTemperatureAttacker:
             mask = torch.zeros_like(logits, dtype=torch.bool).scatter_(2, indices, 1)
             return torch.where(mask, logits, torch.full_like(logits, float('-inf')))
 
+    #
+
     def _batch_log_bleulosscnn_ae(self, decoder_outputs, target_idx, ngram_list=[1]):
         log_probs = F.log_softmax(decoder_outputs, dim=-1)
         target_log_probs = torch.gather(log_probs, 2, target_idx.unsqueeze(0).expand(log_probs.shape[0], -1, -1))
@@ -214,13 +221,13 @@ class DynamicTemperatureAttacker:
         prompt_embeds = self.target_llm.get_input_embeddings()(prompt_ids).detach()
         suffix_logits = self._initialize_suffix_logits(prompt_ids, params)
         best_overall_score, best_results = -1.0, {}
-
         if params.mask_rejection_words:
             rej_words_str = " ".join(list(set(REJ_WORDS)))
             rej_word_ids = self.target_tokenizer(rej_words_str, add_special_tokens=False,
                                                  return_tensors="pt").input_ids.to(self.target_llm_device)
         else:
             rej_word_ids = None
+
 
         for i in tqdm(range(params.num_outer_iters), desc="Outer Loop"):
             target_ids, ref_score, ref_text = self._generate_and_select_reference(prompt_embeds, suffix_logits, params)
@@ -237,7 +244,7 @@ class DynamicTemperatureAttacker:
             base_logits_float32 = suffix_logits.detach().clone().float()
             noise = torch.zeros_like(base_logits_float32, requires_grad=True)
             optimizer = torch.optim.AdamW([noise], lr=params.learning_rate)
-
+            #
             for j in tqdm(range(params.num_inner_iters), desc="Inner Loop", leave=False):
                 optimizer.zero_grad()
                 current_logits_float32 = base_logits_float32 + noise
@@ -321,37 +328,31 @@ class DynamicTemperatureAttacker:
             w_ce=w_ce, w_flu=w_flu, w_rej=w_rej
         )
 
-        # 2. 截取当前批次需要处理的 prompts
+        # 2. 准备样本
         prompts_to_attack = target_set[start_index:min(end_index, len(target_set))]
         all_results = []
 
-        # 3. 确保保存目录存在 (如果提供了 save_path)
+        # 3. 准备保存目录
         file_root, file_ext = "", ""
         if save_path:
-            # 分离文件名和后缀，例如 "outputs/res.json" -> root="outputs/res", ext=".json"
             file_root, file_ext = os.path.splitext(save_path)
-            # 获取目录路径
             dir_name = os.path.dirname(file_root)
             if dir_name and not os.path.exists(dir_name):
                 try:
                     os.makedirs(dir_name)
-                    logger.info(f"Created directory: {dir_name}")
                 except OSError as e:
                     logger.error(f"Failed to create directory {dir_name}: {e}")
 
-        # 4. 循环处理每个样本
+        # 4. 循环处理
         for i, prompt in enumerate(prompts_to_attack):
-            # 计算全局索引，用于生成唯一文件名
             global_idx = start_index + i
 
             logger.info(
-                f"\n{'=' * 20} Attacking Prompt {global_idx} (Batch index {i + 1}/{len(prompts_to_attack)}) {'=' * 20}")
-            logger.info(f"Prompt: '{prompt}'")
+                f"\n{'=' * 20} Attacking Prompt {global_idx} (Batch {i + 1}/{len(prompts_to_attack)}) {'=' * 20}")
 
-            # 执行攻击优化
+            # 执行优化
             try:
                 result = self._optimize_single_prompt(prompt, attack_params)
-                # 可以在结果中额外记录一下索引信息
                 result['index'] = global_idx
             except Exception as e:
                 logger.error(f"Error optimizing prompt index {global_idx}: {e}", exc_info=True)
@@ -359,15 +360,21 @@ class DynamicTemperatureAttacker:
 
             all_results.append(result)
 
+
+            console_output = json.dumps(result, ensure_ascii=False, indent=4)
+            logger.info(f"*** Result for Sample {global_idx} ***\n{console_output}")
+
+            #
             if save_path:
-                # 构造独立的文件名，例如: outputs/res_0.json, outputs/res_1.json
                 current_file_path = f"{file_root}_{global_idx}{file_ext}"
                 try:
                     with open(current_file_path, "w", encoding="utf-8") as f:
-                        # indent=4 让单个文件更易读，因为它们不再需要是 jsonl 格式
-                        json.dump(result, f, ensure_ascii=False, indent=4)
-                    logger.info(f"Saved result for sample {global_idx} to: {current_file_path}")
+                        # 写入文件也保持良好的格式
+                        f.write(console_output)
+                    logger.info(f"Saved result file to: {current_file_path}")
                 except Exception as e:
                     logger.error(f"Failed to save file {current_file_path}: {e}")
 
         return all_results
+
+
