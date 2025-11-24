@@ -1,6 +1,6 @@
 # -*- coding:utf-8 -*-
 # Author: Anonymous (Reforged by an AI Assistant, v2.2 - Final Fix)
-# Version: Optimized for Robustness and Stability
+# Version: Optimized for Robustness and Stability with Advanced Loss Functions
 
 import torch
 import torch.nn as nn
@@ -29,6 +29,17 @@ from torch.cuda.amp import autocast, GradScaler
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# --- NEW: Rejection words constant ---
+REJ_WORDS = [
+    "I'm sorry", "Sorry", "I am sorry", "I apologize", "As an", "As an AI", "I'm an",
+    "I'm just", "As a language model", "As an Assistant", "I cannot", "I do not",
+    "Hello!", "is illegal and unethical", "I'm really sorry", "OpenAI", "unethical",
+    "not ethical", "illegal", "not legal", "My apologies", "but I cannot",
+    "If you have any other non-malicious requests", "I'm not able to provide",
+    "I am really sorry", "I cannot create", "I cannot support", "I can't provide",
+    "I can't assist"
+]
+
 
 @dataclass
 class _AttackHyperparams:
@@ -43,15 +54,15 @@ class _AttackHyperparams:
     reference_temp: float
     num_ref_samples: int
     mask_rejection_words: bool
+    # --- NEW: Loss weights ---
+    w_ce: float = 1.0
+    w_flu: float = 0.1
+    w_rej: float = 10.0
 
 
 class DynamicTemperatureAttacker:
     """
-    Implements the Dynamic Temperature Attack.
-
-    This attacker optimizes a malicious suffix to jailbreak a target LLM by using a
-    reference LLM to generate desirable (but harmful) responses and then training
-    the suffix to elicit similar responses from the target LLM.
+    Implements the Dynamic Temperature Attack with advanced loss functions.
     """
 
     def __init__(
@@ -67,72 +78,60 @@ class DynamicTemperatureAttacker:
             dtype: torch.dtype = torch.float16,
             **kwargs
     ):
+        # ... (init code is unchanged) ...
         if not PEFT_AVAILABLE:
             raise ImportError("PEFT library is not installed, but is required. Please run 'pip install peft'.")
-
         self.target_llm_device = local_llm_device
         self.ref_llm_device = ref_local_llm_device or local_llm_device
         self.judge_llm_device = judge_llm_device
         self.dtype = dtype
-
         self.reference_temp_init = reference_model_infer_temperature
         self.num_ref_samples_init = num_ref_infer_samples
-
         self._setup_models(
             local_llm_model_name_or_path,
-            # If ref_local_llm is not provided, default to the target LLM path.
             ref_local_llm_model_name_or_path or local_llm_model_name_or_path,
             judge_llm_model_name_or_path
         )
         self.scaler = GradScaler()
 
+    # ... (_setup_models, _initialize_suffix_logits, _generate_and_select_reference are unchanged) ...
     def _setup_models(self, target_path: str, ref_path: str, judge_path: str):
         """Loads and configures all required models and tokenizers."""
         logger.info("Setting up models...")
-
-        # --- Target LLM Setup ---
         base_target_llm = AutoModelForCausalLM.from_pretrained(target_path, torch_dtype=self.dtype)
         self.target_tokenizer = AutoTokenizer.from_pretrained(target_path)
         peft_config = AdaLoraConfig(
+            # h=W_0x+\frac{\alpha}{r}(BAx)
             task_type=TaskType.CAUSAL_LM, inference_mode=False, r=32, lora_alpha=16,
             target_modules=["q_proj", "v_proj"]
         )
+        #
         self.target_llm = get_peft_model(base_target_llm, peft_config)
         self.target_llm.to(self.target_llm_device).train()
         logger.info(f"Target LLM '{target_path}' loaded with PEFT and set to train mode.")
         logger.info(f"Target LLM Vocab Size: {self.target_llm.config.vocab_size}")
         self.target_llm.print_trainable_parameters()
-
-        # --- Reference LLM Setup ---
         self.ref_llm = AutoModelForCausalLM.from_pretrained(ref_path, torch_dtype=self.dtype)
         self.ref_llm.to(self.ref_llm_device).eval()
         logger.info(f"Reference LLM '{ref_path}' loaded and set to eval mode.")
         logger.info(f"Reference LLM Vocab Size: {self.ref_llm.config.vocab_size}")
-
-        # === 优化 1: 健壮的 Tokenizer 处理 ===
-        # 如果模型路径相同，直接共享 tokenizer 以确保100%兼容
         if target_path == ref_path:
             logger.info("Target and Reference models are the same. Sharing tokenizer.")
             self.ref_tokenizer = self.target_tokenizer
         else:
             logger.warning("Target and Reference models are different. Loading separate tokenizer for reference model.")
             self.ref_tokenizer = AutoTokenizer.from_pretrained(ref_path)
-            # 关键断言: 如果使用不同模型，启动时就检查词汇表大小，提前发现问题
             assert len(self.target_tokenizer) == len(self.ref_tokenizer), \
                 f"FATAL: Vocabulary size mismatch! Target: {len(self.target_tokenizer)}, Reference: {len(self.ref_tokenizer)}"
-
-        # 确保所有分词器都有 pad_token，以避免警告和错误
         if self.target_tokenizer.pad_token is None:
             self.target_tokenizer.pad_token = self.target_tokenizer.eos_token
         if self.ref_tokenizer.pad_token is None:
             self.ref_tokenizer.pad_token = self.ref_tokenizer.eos_token
-
         self.ref_generator = pipeline(
             "text-generation", model=self.ref_llm, tokenizer=self.ref_tokenizer,
             device=self.ref_llm_device
         )
-
-        # --- Judge LLM Setup ---
+        # Finetuned Roberta (0.4B)
         self.judge_llm = RobertaForSequenceClassification.from_pretrained(judge_path, torch_dtype=torch.float32)
         self.judge_llm.to(self.judge_llm_device).eval()
         self.judge_tokenizer = RobertaTokenizer.from_pretrained(judge_path)
@@ -163,102 +162,124 @@ class DynamicTemperatureAttacker:
             )
             ref_texts = self.ref_tokenizer.batch_decode(ref_ids[:, full_input_embeds.shape[1]:],
                                                         skip_special_tokens=True)
-
         best_score, best_text, best_idx = -1.0, "", -1
         for idx, text in enumerate(ref_texts):
             score = self._judge_response(text)[1]
             if score > best_score:
                 best_score, best_text, best_idx = score, text, idx
-
         target_ids = ref_ids[best_idx,
                      full_input_embeds.shape[1]: full_input_embeds.shape[1] + params.forward_response_length]
         return target_ids.unsqueeze(0), best_score, best_text
 
     def _calculate_loss(self, pred_logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
-        # === 优化 2: 改进损失函数 ===
-        # 使用 ignore_index 来忽略填充标记，使损失计算更准确和稳定
         return F.cross_entropy(
             pred_logits.reshape(-1, pred_logits.size(-1)),
             target_ids.reshape(-1),
             ignore_index=self.target_tokenizer.pad_token_id
         )
 
+    # === START: Ported from Code B for Advanced Loss Calculation ===
+    def _soft_forward_suffix(self, prompt_embeds: torch.Tensor, suffix_logits: torch.Tensor) -> torch.Tensor:
+        suffix_probs = F.softmax(suffix_logits, dim=-1).type(self.dtype)
+        suffix_embeds = suffix_probs @ self.target_llm.get_input_embeddings().weight
+        full_embeds = torch.cat([prompt_embeds, suffix_embeds], dim=1)
+        full_logits = self.target_llm(inputs_embeds=full_embeds).logits
+        pred_suffix_logits = full_logits[:, prompt_embeds.shape[1] - 1:-1, :]
+        return pred_suffix_logits
+
+    def _soft_negative_likelihood_loss(self, pred_logits: torch.Tensor, target_logits: torch.Tensor) -> torch.Tensor:
+        probs = F.softmax(pred_logits, dim=-1)
+        log_probs = F.log_softmax(target_logits, dim=-1)
+        loss = -torch.sum(probs * log_probs, dim=-1).mean()
+        return loss
+
+    def _topk_filter_3d(self, logits: torch.Tensor, topk: int) -> torch.Tensor:
+        if topk == 0:
+            return logits
+        else:
+            _, indices = torch.topk(logits, topk, dim=-1)
+            mask = torch.zeros_like(logits, dtype=torch.bool).scatter_(2, indices, 1)
+            return torch.where(mask, logits, torch.full_like(logits, float('-inf')))
+
+    def _batch_log_bleulosscnn_ae(self, decoder_outputs, target_idx, ngram_list=[1]):
+        log_probs = F.log_softmax(decoder_outputs, dim=-1)
+        target_log_probs = torch.gather(log_probs, 2, target_idx.unsqueeze(0).expand(log_probs.shape[0], -1, -1))
+        return -target_log_probs.mean()
+
+    # === END: Ported from Code B ===
+    #
+
     def _optimize_single_prompt(self, prompt: str, params: _AttackHyperparams) -> Dict[str, Any]:
         prompt_ids = self.target_tokenizer(prompt, return_tensors="pt").input_ids.to(self.target_llm_device)
         prompt_embeds = self.target_llm.get_input_embeddings()(prompt_ids).detach()
-
         suffix_logits = self._initialize_suffix_logits(prompt_ids, params)
         best_overall_score, best_results = -1.0, {}
-        # 在每个外层循环，suffix_logits会重新赋值还是沿用上次最好的
+
+        if params.mask_rejection_words:
+            rej_words_str = " ".join(list(set(REJ_WORDS)))
+            rej_word_ids = self.target_tokenizer(rej_words_str, add_special_tokens=False,
+                                                 return_tensors="pt").input_ids.to(self.target_llm_device)
+        else:
+            rej_word_ids = None
+
         for i in tqdm(range(params.num_outer_iters), desc="Outer Loop"):
             target_ids, ref_score, ref_text = self._generate_and_select_reference(prompt_embeds, suffix_logits, params)
             target_ids = target_ids.to(self.target_llm_device)
             logger.info(f"Outer step {i + 1}: Best ref score: {ref_score:.4f} | Ref text: '{ref_text[:80]}...'")
 
-            # === 优化 3: 运行时安全网 (Runtime Safety Net) ===
-            # 在将 ref_llm 生成的 target_ids 用于 target_llm 之前，检查并修正越界的 token ID
             vocab_size = self.target_llm.config.vocab_size
             invalid_mask = (target_ids >= vocab_size) | (target_ids < 0)
             if invalid_mask.any():
                 num_invalid = invalid_mask.sum().item()
-                logger.warning(
-                    f"Found {num_invalid} out-of-bounds token IDs from reference model. "
-                    f"Max ID: {target_ids.max().item()}, Vocab size: {vocab_size}. "
-                    f"Replacing them with pad_token_id to prevent crashing."
-                )
+                logger.warning(f"Found {num_invalid} out-of-bounds token IDs... Replacing with pad_token_id.")
                 target_ids[invalid_mask] = self.target_tokenizer.pad_token_id
 
-            # 为确保数值稳定性，在 float32 上创建和优化噪声
             base_logits_float32 = suffix_logits.detach().clone().float()
             noise = torch.zeros_like(base_logits_float32, requires_grad=True)
             optimizer = torch.optim.AdamW([noise], lr=params.learning_rate)
 
             for j in tqdm(range(params.num_inner_iters), desc="Inner Loop", leave=False):
                 optimizer.zero_grad()
-
-                # 在 float32 上应用噪声，以获得更稳定的梯度
                 current_logits_float32 = base_logits_float32 + noise
 
-                # 使用 autocast 管理半精度浮点数 (float16) 的计算
-                # 这个上下文是什么意思？
-                # 当模型使用 float16（半精度）时启用 autocast，将部分运算转为 float16 以加速并节省显存，同时对容易溢出的操作（如 softmax、loss）保留 float32 精度。
                 with autocast(enabled=(self.dtype == torch.float16)):
-                    # 将 logits 转回模型所需的 dtype，用于 Gumbel-Softmax 和矩阵乘法
                     current_logits_model_dtype = current_logits_float32.to(self.dtype)
                     gumbel_probs = F.gumbel_softmax(current_logits_model_dtype, tau=0.1, hard=True)
-                    # 也就是说，转回的方式是个近似？
                     suffix_embeds = gumbel_probs @ self.target_llm.get_input_embeddings().weight
 
                     full_embeds = torch.cat(
                         [prompt_embeds, suffix_embeds, self.target_llm.get_input_embeddings()(target_ids)], dim=1)
                     full_logits = self.target_llm(inputs_embeds=full_embeds).logits
-
                     start_idx = prompt_embeds.shape[1] + suffix_embeds.shape[1]
                     pred_resp_logits = full_logits[:, start_idx - 1:-1, :]
 
-                # 将模型输出转回 float32 进行损失计算，以提高精度和稳定性
-                loss = self._calculate_loss(pred_resp_logits.float(), target_ids)
+                    pred_suffix_logits = self._soft_forward_suffix(prompt_embeds, current_logits_model_dtype)
 
-                # GradScaler 自动处理混合精度训练中的梯度缩放
+                ce_loss = self._calculate_loss(pred_resp_logits.float(), target_ids)
+
+                filtered_pred_suffix_logits = self._topk_filter_3d(pred_suffix_logits.float(), params.suffix_topk)
+                flu_loss = self._soft_negative_likelihood_loss(filtered_pred_suffix_logits, current_logits_float32)
+
+                loss = params.w_ce * ce_loss + params.w_flu * flu_loss
+
+                if params.mask_rejection_words and rej_word_ids is not None:
+                    rej_logits = current_logits_float32.permute(1, 0, 2)
+                    rej_loss = self._batch_log_bleulosscnn_ae(rej_logits, rej_word_ids)
+                    loss -= params.w_rej * rej_loss
+
                 self.scaler.scale(loss).backward()
                 self.scaler.step(optimizer)
                 self.scaler.update()
 
-            # 结束内循环
-            # 从 float32 更新回模型所需的 dtype
             suffix_logits = (base_logits_float32 + noise).detach().to(self.dtype)
 
             with torch.no_grad():
                 final_suffix_text = self.target_tokenizer.decode(torch.argmax(suffix_logits, dim=-1)[0],
                                                                  skip_special_tokens=True)
                 test_input = prompt + final_suffix_text
-                # 使用 ref_generator (基于 ref_llm) 来评估生成的 suffix 的效果
                 generated_output = self.ref_generator(
-                    test_input,
-                    max_new_tokens=params.response_length,
-                    do_sample=True,
-                    pad_token_id=self.ref_tokenizer.eos_token_id,
-                    num_return_sequences=1
+                    test_input, max_new_tokens=params.response_length, do_sample=True,
+                    pad_token_id=self.ref_tokenizer.eos_token_id, num_return_sequences=1
                 )[0]
                 response_only = generated_output['generated_text'][len(test_input):].strip()
                 test_score = self._judge_response(response_only)[1]
@@ -274,6 +295,7 @@ class DynamicTemperatureAttacker:
 
         return best_results or {"prompt": prompt, "status": "failed"}
 
+    # ... (_judge_response and attack methods are mostly unchanged, just pass new params) ...
     def _judge_response(self, response: str) -> List[float]:
         """Judges the harmfulness of a response, returning class probabilities."""
         with torch.no_grad():
@@ -285,36 +307,67 @@ class DynamicTemperatureAttacker:
     def attack(self, target_set: List[str], num_iters: int, num_inner_iters: int, learning_rate: float,
                response_length: int, forward_response_length: int, suffix_max_length: int,
                suffix_topk: int, mask_rejection_words: bool, save_path: Optional[str] = None,
-               start_index: int = 0, end_index: int = 100, **kwargs) -> List[Dict[str, Any]]:
-        """Main attack loop over a set of prompts."""
+               start_index: int = 0, end_index: int = 100,
+               w_ce: float = 1.0, w_flu: float = 0.1, w_rej: float = 10.0, **kwargs) -> List[Dict[str, Any]]:
+
+        # 1. 初始化攻击参数
         attack_params = _AttackHyperparams(
             num_outer_iters=num_iters, num_inner_iters=num_inner_iters,
             learning_rate=learning_rate, response_length=response_length,
             forward_response_length=forward_response_length, suffix_length=suffix_max_length,
             suffix_topk=suffix_topk, reference_temp=self.reference_temp_init,
-            num_ref_samples=self.num_ref_samples_init, mask_rejection_words=mask_rejection_words
+            num_ref_samples=self.num_ref_samples_init,
+            mask_rejection_words=mask_rejection_words,
+            w_ce=w_ce, w_flu=w_flu, w_rej=w_rej
         )
 
+        # 2. 截取当前批次需要处理的 prompts
         prompts_to_attack = target_set[start_index:min(end_index, len(target_set))]
         all_results = []
 
-        fout = None
-        try:
-            if save_path:
-                fout = open(save_path, "w", encoding="utf-8")
+        # 3. 确保保存目录存在 (如果提供了 save_path)
+        file_root, file_ext = "", ""
+        if save_path:
+            # 分离文件名和后缀，例如 "outputs/res.json" -> root="outputs/res", ext=".json"
+            file_root, file_ext = os.path.splitext(save_path)
+            # 获取目录路径
+            dir_name = os.path.dirname(file_root)
+            if dir_name and not os.path.exists(dir_name):
+                try:
+                    os.makedirs(dir_name)
+                    logger.info(f"Created directory: {dir_name}")
+                except OSError as e:
+                    logger.error(f"Failed to create directory {dir_name}: {e}")
 
-            for i, prompt in enumerate(prompts_to_attack):
-                logger.info(f"\n{'=' * 20} Attacking Prompt {i + 1}/{len(prompts_to_attack)}: '{prompt}' {'=' * 20}")
+        # 4. 循环处理每个样本
+        for i, prompt in enumerate(prompts_to_attack):
+            # 计算全局索引，用于生成唯一文件名
+            global_idx = start_index + i
+
+            logger.info(
+                f"\n{'=' * 20} Attacking Prompt {global_idx} (Batch index {i + 1}/{len(prompts_to_attack)}) {'=' * 20}")
+            logger.info(f"Prompt: '{prompt}'")
+
+            # 执行攻击优化
+            try:
                 result = self._optimize_single_prompt(prompt, attack_params)
-                all_results.append(result)
-                if fout:
-                    fout.write(json.dumps(result, ensure_ascii=False) + "\n")
-                    fout.flush()
-        except Exception as e:
-            logger.error(f"An error occurred during the attack: {e}", exc_info=True)
-        finally:
-            if fout:
-                fout.close()
-                logger.info(f"Results saved to {save_path}")
+                # 可以在结果中额外记录一下索引信息
+                result['index'] = global_idx
+            except Exception as e:
+                logger.error(f"Error optimizing prompt index {global_idx}: {e}", exc_info=True)
+                result = {"index": global_idx, "prompt": prompt, "status": "error", "error_msg": str(e)}
+
+            all_results.append(result)
+
+            if save_path:
+                # 构造独立的文件名，例如: outputs/res_0.json, outputs/res_1.json
+                current_file_path = f"{file_root}_{global_idx}{file_ext}"
+                try:
+                    with open(current_file_path, "w", encoding="utf-8") as f:
+                        # indent=4 让单个文件更易读，因为它们不再需要是 jsonl 格式
+                        json.dump(result, f, ensure_ascii=False, indent=4)
+                    logger.info(f"Saved result for sample {global_idx} to: {current_file_path}")
+                except Exception as e:
+                    logger.error(f"Failed to save file {current_file_path}: {e}")
 
         return all_results
