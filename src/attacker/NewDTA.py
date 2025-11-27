@@ -149,6 +149,7 @@ class DynamicTemperatureAttacker:
                 pad_token_id=self.target_tokenizer.eos_token_id
             )
             full_ids = torch.cat([prompt_ids, gen_output[:, prompt_ids.shape[1]:]], dim=1)
+            logger.info(f"decode_full_ids: {self.target_tokenizer.decode(full_ids[0].tolist(), skip_special_tokens=True)}")
             full_logits = self.target_llm(full_ids).logits
             return full_logits[:, prompt_ids.shape[1] - 1:-1, :].detach()
 
@@ -232,7 +233,7 @@ class DynamicTemperatureAttacker:
         for i in tqdm(range(params.num_outer_iters), desc="Outer Loop"):
             target_ids, ref_score, ref_text = self._generate_and_select_reference(prompt_embeds, suffix_logits, params)
             target_ids = target_ids.to(self.target_llm_device)
-            logger.info(f"target_ids: {self.target_tokenizer.decode(target_ids, skip_special_tokens=True)}")
+            logger.info(f"target_ids: {self.target_tokenizer.decode(target_ids[0], skip_special_tokens=True)}")
             logger.info(f"Outer step {i + 1}: Best ref score: {ref_score:.4f} | Ref text: '{ref_text[:80]}...'")
 
             vocab_size = self.target_llm.config.vocab_size
