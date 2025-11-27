@@ -175,6 +175,8 @@ class DynamicTemperatureAttacker:
                 best_score, best_text, best_idx = score, text, idx
         target_ids = ref_ids[best_idx,
                      full_input_embeds.shape[1]: full_input_embeds.shape[1] + params.forward_response_length]
+        logger.info(f"best text: {best_text}")
+        input()
         return target_ids.unsqueeze(0), best_score, best_text
 
     def _calculate_loss(self, pred_logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
