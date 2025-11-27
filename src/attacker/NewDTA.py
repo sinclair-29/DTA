@@ -232,6 +232,7 @@ class DynamicTemperatureAttacker:
         for i in tqdm(range(params.num_outer_iters), desc="Outer Loop"):
             target_ids, ref_score, ref_text = self._generate_and_select_reference(prompt_embeds, suffix_logits, params)
             target_ids = target_ids.to(self.target_llm_device)
+            logger.info(f"target_ids: {self.target_tokenizer.decode(target_ids, skip_special_tokens=True)}")
             logger.info(f"Outer step {i + 1}: Best ref score: {ref_score:.4f} | Ref text: '{ref_text[:80]}...'")
 
             vocab_size = self.target_llm.config.vocab_size
@@ -270,7 +271,7 @@ class DynamicTemperatureAttacker:
                 loss = params.w_ce * ce_loss + params.w_flu * flu_loss
 
                 if params.mask_rejection_words and rej_word_ids is not None:
-                    rej_logits = current_logits_float32.permute(1, 0, 2)
+                    rej_logits = current_logits_float32.permute(1, 0, 2) # rej_logits shape = (batch_size, seq_len, vocab_size)
                     rej_loss = self._batch_log_bleulosscnn_ae(rej_logits, rej_word_ids)
                     loss -= params.w_rej * rej_loss
 

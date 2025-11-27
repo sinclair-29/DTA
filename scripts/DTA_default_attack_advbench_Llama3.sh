@@ -3,10 +3,11 @@
 BASE_PATH="../LLMJailbreak" 
 
 TARGET_MODEL_PATH="$BASE_PATH/models/Llama-2-7b-chat-hf"
-REFERENCE_MODEL_PATH="$BASE_PATH/models/Mistral-7B-Instruct-v0.3"
+#REFERENCE_MODEL_PATH="$BASE_PATH/models/Mistral-7B-Instruct-v0.3"
+REFERENCE_MODEL_PATH="$BASE_PATH/models/Llama-2-7b-chat-hf"
 JUDGE_MODEL_PATH="$BASE_PATH/models/GPTFuzzer"
 DATA_FILE="$BASE_PATH/data/harmful_behaviors.csv"
-SAVE_DIR="./results/dta_llama2_mistral_advbench_quick"
+SAVE_DIR="./results/dta_llama2_llama2_advbench_test_reference"
 
 mkdir -p "$SAVE_DIR"
 
