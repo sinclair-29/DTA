@@ -176,7 +176,6 @@ class DynamicTemperatureAttacker:
         target_ids = ref_ids[best_idx,
                      full_input_embeds.shape[1]: full_input_embeds.shape[1] + params.forward_response_length]
         logger.info(f"best text: {best_text}")
-        input()
         return target_ids.unsqueeze(0), best_score, best_text
 
     def _calculate_loss(self, pred_logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
@@ -219,7 +218,7 @@ class DynamicTemperatureAttacker:
     # === END: Ported from Code B ===
     #
 
-    def _optimize_single_prompt(self, prompt: str, params: _AttackHyperparams) -> Dict[str, Any]:
+    def _optimize_single_prompt(self, prompt: str, params: _AttackHyperparams, affirmation = None) -> Dict[str, Any]:
         prompt_ids = self.target_tokenizer(prompt, return_tensors="pt").input_ids.to(self.target_llm_device)
         prompt_embeds = self.target_llm.get_input_embeddings()(prompt_ids).detach()
         suffix_logits = self._initialize_suffix_logits(prompt_ids, params)
@@ -233,7 +232,10 @@ class DynamicTemperatureAttacker:
 
 
         for i in tqdm(range(params.num_outer_iters), desc="Outer Loop"):
-            target_ids, ref_score, ref_text = self._generate_and_select_reference(prompt_embeds, suffix_logits, params)
+            if affirmation is None:
+                target_ids, ref_score, ref_text = self._generate_and_select_reference(prompt_embeds, suffix_logits, params)
+            else:
+                target_ids = self.ref_tokenizer(affirmation, return_tensors="pt").input_ids.to(self.ref_llm_device).unsqueeze(0)
             target_ids = target_ids.to(self.target_llm_device)
             logger.info(f"target_ids: {self.target_tokenizer.decode(target_ids[0], skip_special_tokens=True)}")
             logger.info(f"Outer step {i + 1}: Best ref score: {ref_score:.4f} | Ref text: '{ref_text[:80]}...'")
@@ -315,7 +317,7 @@ class DynamicTemperatureAttacker:
             probs = F.softmax(self.judge_llm(**inputs).logits, dim=-1)
             return probs.squeeze().cpu().tolist()
 
-    def attack(self, target_set: List[str], num_iters: int, num_inner_iters: int, learning_rate: float,
+    def attack(self, target_set: List[str], affirmation_set, num_iters: int, num_inner_iters: int, learning_rate: float,
                response_length: int, forward_response_length: int, suffix_max_length: int,
                suffix_topk: int, mask_rejection_words: bool, save_path: Optional[str] = None,
                start_index: int = 0, end_index: int = 100,
@@ -334,6 +336,7 @@ class DynamicTemperatureAttacker:
 
         # 2. 准备样本
         prompts_to_attack = target_set[start_index:min(end_index, len(target_set))]
+        target_to_attack = affirmation_set[start_index:min(end_index, len(affirmation_set))]
         all_results = []
 
         # 3. 准备保存目录
@@ -350,13 +353,14 @@ class DynamicTemperatureAttacker:
         # 4. 循环处理
         for i, prompt in enumerate(prompts_to_attack):
             global_idx = start_index + i
+            affirmation = affirmation_set[global_idx]
 
             logger.info(
                 f"\n{'=' * 20} Attacking Prompt {global_idx} (Batch {i + 1}/{len(prompts_to_attack)}) {'=' * 20}")
 
             # 执行优化
             try:
-                result = self._optimize_single_prompt(prompt, attack_params)
+                result = self._optimize_single_prompt(prompt, attack_params, affirmation=affirmation)
                 result['index'] = global_idx
             except Exception as e:
                 logger.error(f"Error optimizing prompt index {global_idx}: {e}", exc_info=True)

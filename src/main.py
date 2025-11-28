@@ -262,6 +262,7 @@ def main():
     
     print("[INIT] LOADING THE TARGET DATASET...")
     target_set = load_target_set(fn)
+    affirmation_set = load_affirmation(fn)
     
     all_results = attackers.attack(
         target_set=target_set,

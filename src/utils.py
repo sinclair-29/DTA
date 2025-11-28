@@ -324,3 +324,18 @@ def load_target_set(fn):
         except:
             target_set = data["goal"].tolist()
     return target_set
+
+def load_affirmation(fn):
+    """
+    Load a target set from a file.
+
+    Args:
+        fn (`str`): The file name of the target set.
+
+    Returns:
+        `List[str]`: The loaded target set.
+    """
+    with open(fn, "r") as fin:
+        data = pd.read_csv(fin)
+        target_set = data["target"].tolist()
+    return target_set
