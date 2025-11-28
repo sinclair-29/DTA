@@ -266,6 +266,7 @@ def main():
     
     all_results = attackers.attack(
         target_set=target_set,
+        affirmation_set=affirmation_set,
         num_iters=num_outer_iters,
         num_inner_iters=num_inner_iters,
         learning_rate=learning_rate,
